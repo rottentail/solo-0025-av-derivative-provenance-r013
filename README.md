@@ -201,6 +201,30 @@ python3 scripts/workflow_checks.py verify-reproduction
 Each check starts a temporary HTTP server, generates media bytes in memory,
 exercises the public endpoints, and shuts the server down.
 
+## Memory profile
+
+The audio path never holds a parent WAV, a decoded clip, or an encoded result
+as one large buffer. Stored parents are read and decoded in 65,536-frame
+chunks into packed 16-bit channel arrays, gain and normalize rewrite those
+arrays in place, mix writes one output channel at a time, and the encoded WAV
+is streamed into a digest (or straight to its staging file) instead of being
+assembled in memory. The integrity check streams the same way, so a replay
+does not need a second copy of the output.
+
+The measurement helper drives the public HTTP boundary with one 24 MiB stereo
+fixture and reports the child process peak for ingest, rendition, and replay:
+
+```bash
+python3 scripts/audio_memory_probe.py
+```
+
+On a dataset sized at the 24 MiB decoded-media budget (a 25.1 MiB primary and a
+23.6 MiB secondary, both stereo 48 kHz), the peak of the service process on
+this host for one mix plus normalize plan was about 1.55 GiB before the change
+and about 108 MiB after it; replay dropped the same way. Both runs store the
+same output WAV byte for byte, so no rounding, clipping, channel balance, or
+whole-clip normalization semantics changed.
+
 ## Environment
 
 No environment variables are required. Runtime choices use `--host`, `--port`,

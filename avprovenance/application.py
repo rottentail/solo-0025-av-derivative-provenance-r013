@@ -20,8 +20,8 @@ from .models import (
 from .media import inspect_media
 from .renditions import (
     compile_plan,
-    execute_plan,
-    reproduce_output,
+    execute_plan_to_file,
+    reproduce_output_files,
 )
 from .serialization import (
     deep_copy,
@@ -48,9 +48,6 @@ class MediaProvenanceApplication:
         self.content_files = ContentFileRepository(self.data_dir / "content")
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
-
-    def _asset_bytes(self, asset: MediaAsset) -> bytes:
-        return self.content_files.read(asset.content_key)
 
     def _rendition_view(self, rendition: Rendition) -> dict[str, Any]:
         value = rendition.to_dict()
@@ -153,23 +150,32 @@ class MediaProvenanceApplication:
         self.repository.transition_rendition(rendition.id, "running")
 
         try:
-            primary_bytes = self._asset_bytes(primary)
-            secondary_bytes = self._asset_bytes(secondary) if secondary else None
-            outcome = execute_plan(
-                primary_bytes,
-                plan.operations,
-                secondary_bytes,
+            primary_path = self.content_files.path_for_key(primary.content_key)
+            secondary_path = (
+                self.content_files.path_for_key(secondary.content_key)
+                if secondary
+                else None
             )
-            output_digest = sha256_hex(outcome.data)
-            output_key = self.content_files.key_for_digest(output_digest)
-            output_existed = self.content_files.exists(output_key)
-            self.content_files.write(outcome.data, output_digest)
+            staged = self.content_files.staging_path()
+            try:
+                outcome = execute_plan_to_file(
+                    primary_path,
+                    plan.operations,
+                    secondary_path,
+                    staged,
+                )
+                output_key = self.content_files.key_for_digest(outcome.digest)
+                output_existed = self.content_files.exists(output_key)
+                self.content_files.adopt(staged, outcome.digest)
+            except BaseException:
+                self.content_files.discard_staged(staged)
+                raise
             output_asset = MediaAsset(
                 id=new_identifier("asset"),
                 filename=output_name,
                 kind=outcome.descriptor.kind,
-                sha256=output_digest,
-                size_bytes=len(outcome.data),
+                sha256=outcome.digest,
+                size_bytes=outcome.size_bytes,
                 content_key=output_key,
                 descriptor=outcome.descriptor,
                 created_at=utc_now(),
@@ -289,11 +295,13 @@ class MediaProvenanceApplication:
 
         expected_descriptor = output_asset.descriptor.to_dict()
         try:
-            recorded_output = self._asset_bytes(output_asset)
-            primary_bytes = self._asset_bytes(primary_asset)
-            secondary_bytes = (
-                self._asset_bytes(secondary_asset) if secondary_asset else None
+            primary_path = self.content_files.require_readable(primary_asset.content_key)
+            secondary_path = (
+                self.content_files.require_readable(secondary_asset.content_key)
+                if secondary_asset
+                else None
             )
+            output_path = self.content_files.require_readable(output_asset.content_key)
         except ApplicationError:
             self._finish_mismatch(
                 audit,
@@ -324,13 +332,18 @@ class MediaProvenanceApplication:
                 expected_descriptor=expected_descriptor,
             )
 
-        outcome = reproduce_output(
-            output_asset=output_asset,
-            recorded_output_bytes=recorded_output,
-            primary_bytes=primary_bytes,
-            operations=deep_copy(rendition.operations),
-            secondary_bytes=secondary_bytes,
-        )
+        scratch_path = self.content_files.staging_path()
+        try:
+            outcome = reproduce_output_files(
+                output_asset=output_asset,
+                output_path=output_path,
+                primary_path=primary_path,
+                operations=deep_copy(rendition.operations),
+                secondary_path=secondary_path,
+                scratch_path=scratch_path,
+            )
+        finally:
+            self.content_files.discard_staged(scratch_path)
         finished = self.repository.settle_integrity_audit(
             audit.id,
             status=outcome.status,

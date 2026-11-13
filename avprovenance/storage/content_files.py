@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -33,6 +34,26 @@ class ContentFileRepository:
             raise PersistenceFailure("A content key escapes the data root.") from exc
         return candidate
 
+    def path_for_key(self, key: str) -> Path:
+        return self._path_for_key(key)
+
+    def require_readable(self, key: str) -> Path:
+        """Resolve a blob path, failing like ``read`` if the file is gone."""
+        path = self._path_for_key(key)
+        if not path.is_file():
+            raise PersistenceFailure("A referenced media file is missing.")
+        return path
+
+    def staging_path(self) -> Path:
+        """A temporary sibling that can be atomically adopted as a blob."""
+        descriptor, name = tempfile.mkstemp(
+            prefix=".content-",
+            suffix=".tmp",
+            dir=self.root,
+        )
+        os.close(descriptor)
+        return Path(name)
+
     def write(self, data: bytes, digest: str) -> str:
         if sha256_hex(data) != digest:
             raise PersistenceFailure("Content digest does not match the supplied bytes.")
@@ -63,6 +84,42 @@ class ContentFileRepository:
                 pass
             raise PersistenceFailure("Media bytes could not be saved.") from exc
         return key
+
+    def adopt(self, staged: str | os.PathLike[str], digest: str) -> str:
+        """Verify a staged file's digest and move it into the content store."""
+        staged_path = Path(staged)
+        key = self.key_for_digest(digest)
+        target = self._path_for_key(key)
+        computed = hashlib.sha256()
+        try:
+            with open(staged_path, "rb") as handle:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    computed.update(chunk)
+        except OSError as exc:
+            staged_path.unlink(missing_ok=True)
+            raise PersistenceFailure("Media bytes could not be saved.") from exc
+        if computed.hexdigest() != digest:
+            staged_path.unlink(missing_ok=True)
+            raise PersistenceFailure("Content digest does not match the supplied bytes.")
+        if target.exists():
+            staged_path.unlink(missing_ok=True)
+            return key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(staged_path, target)
+        except OSError as exc:
+            staged_path.unlink(missing_ok=True)
+            raise PersistenceFailure("Media bytes could not be saved.") from exc
+        return key
+
+    def discard_staged(self, staged: str | os.PathLike[str]) -> None:
+        try:
+            Path(staged).unlink(missing_ok=True)
+        except OSError:
+            return
 
     def read(self, key: str) -> bytes:
         path = self._path_for_key(key)
